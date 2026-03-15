@@ -12,6 +12,7 @@ use windows_sys::Win32::{
         Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
     },
 };
+use crate::classes::c_memory_region::MemoryRegion;
 
 pub struct OpenedProcess {
     handle: HANDLE,
@@ -29,5 +30,49 @@ impl OpenedProcess {
         }
 
         Ok(Self { handle, pid })
+    }
+
+
+    pub fn enumerate_regions(&self) -> io::Result<Vec<MemoryRegion>> {
+        let mut regions = Vec::new();
+        let mut addr = 0usize;
+
+        loop {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+
+            let result = unsafe {
+                VirtualQueryEx(
+                    self.handle,
+                    addr as *const c_void,
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+
+            if result == 0 {
+                break;
+            }
+
+            let base = mbi.BaseAddress as usize;
+            let size = mbi.RegionSize;
+
+            regions.push(MemoryRegion {
+                base_address: base,
+                allocation_base: mbi.AllocationBase as usize,
+                region_size: size,
+                state: mbi.State,
+                protect: mbi.Protect,
+                region_type: mbi.Type,
+            });
+
+            let next = base.saturating_add(size);
+            if next <= addr {
+                break;
+            }
+
+            addr = next;
+        }
+
+        Ok(regions)
     }
 }

@@ -229,8 +229,34 @@ impl App {
                     
                     match open {
                         Ok(p) => {
+                            self.console.add_message(ConsoleRow::new(format!("Process [{}] is opened", process.pid().as_u32()), EMessageType::Success));
+
+                            match p.enumerate_regions(){
+                                Ok(regions) => {
+                                    for region in regions.iter().take(10) {
+                                        let v = format!(
+                                            "base=0x{:X}, alloc_base=0x{:X}, size={}, state=0x{:X}, protect=0x{:X}, type=0x{:X}",
+                                            region.base_address,
+                                            region.allocation_base,
+                                            region.region_size,
+                                            region.state,
+                                            region.protect,
+                                            region.region_type,
+                                        );
+
+                                        self.console.add_message(ConsoleRow::new(v, EMessageType::Success))
+
+                                    }
+
+                                    
+                                }
+                                Err(e) => {
+                                    self.console.add_message(ConsoleRow::new(e.to_string(), EMessageType::Error))
+                                }
+                            }
+
+
                             self.opened_process = Some(p);
-                            self.console.add_message(ConsoleRow::new(format!("Process [{}] is opened", process.pid().as_u32()), EMessageType::Success))
                         }
                         Err(e) => {
                             self.console.add_message(ConsoleRow::new(e.to_string(), EMessageType::Error))
