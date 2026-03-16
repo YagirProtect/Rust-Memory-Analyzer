@@ -4,6 +4,7 @@ use crate::classes::c_console::Console;
 use crate::classes::c_console_row::ConsoleRow;
 use crate::classes::c_opened_process::OpenedProcess;
 use crate::classes::c_processes::Processes;
+use crate::classes::c_select_process_window::SelectProcessWindow;
 use crate::classes::e_message_type::EMessageType;
 
 #[derive(Default)]
@@ -17,6 +18,7 @@ pub struct App{
     pub processes: Processes,
     pub console: Console,
     pub opened_process: Option<OpenedProcess>,
+    pub select_process_window: SelectProcessWindow,
 }
 
 impl App {
@@ -38,6 +40,7 @@ impl Default for App{
             processes: Processes::default(),
             console: Console::default(),
             opened_process: None,
+            select_process_window: SelectProcessWindow::default(),
         }
     }
 }

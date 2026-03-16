@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.44"
 eframe = "0.33.3"
+egui_extras = "0.33"
 
 sysinfo = "0.38.4"
 windows-sys = { version = "0.52.0", features = ["Win32_System_Diagnostics", "Win32_System_Memory", "Win32_System_Diagnostics_Debug"] }

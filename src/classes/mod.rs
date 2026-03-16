@@ -4,4 +4,7 @@ pub mod c_memory_region;
 pub mod c_opened_process;
 pub mod c_console;
 pub mod c_console_row;
+pub mod c_select_process_window;
 pub mod e_message_type;
+pub mod e_value_type;
+pub mod c_scan_result_row;
