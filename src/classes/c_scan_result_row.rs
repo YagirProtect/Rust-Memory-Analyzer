@@ -7,6 +7,7 @@ pub struct ResultRow {
     pub address: usize,
     pub value_type: EValueType,
     pub cached_value: String,
+    pub is_frozen: bool,
 }
 
 pub struct ScanState {

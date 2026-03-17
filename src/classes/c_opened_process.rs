@@ -10,13 +10,16 @@ use std::{ffi::c_void, io, mem::{size_of, zeroed}, thread};
 use windows_sys::Win32::{
     Foundation::HANDLE,
     System::{
-        Diagnostics::Debug::ReadProcessMemory,
+        Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory},
         Memory::{
-            VirtualQueryEx, MEMORY_BASIC_INFORMATION,
+            VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION,
             MEM_COMMIT, MEM_PRIVATE,
-            PAGE_GUARD, PAGE_NOACCESS,
+            PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS,
         },
-        Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        Threading::{
+            OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+            PROCESS_VM_WRITE,
+        },
     },
 };
 
@@ -36,7 +39,8 @@ pub struct OpenedProcess {
 
 impl OpenedProcess {
     pub fn new(pid: u32) -> io::Result<Self> {
-        let access = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
+        let access =
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
         let handle = unsafe { OpenProcess(access, 0, pid) };
 
         if handle == 0 {
@@ -99,7 +103,6 @@ impl OpenedProcess {
         let pid = self.pid;
         let input = self.scan.input_value.trim().to_string();
         let value_type = self.scan.selected_value_type;
-        let max_results = self.scan.scan_results_count.max(1);
 
         let (tx, rx) = mpsc::channel::<ScanMessage>();
         self.scan.results.clear();
@@ -127,8 +130,65 @@ impl OpenedProcess {
             return;
         }
 
-        // TODO: тут потом будет реальный отсев
-        self.scan.results.retain(|_| true);
+        let wanted = match self.scan.input_value.trim().parse::<i32>() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let handle = self.handle;
+        self.scan.results.retain_mut(|row| {
+            match Self::read_bytes_from_handle(handle, row.address, 4) {
+                Ok(bytes) if bytes.len() == 4 => {
+                    let val = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    row.cached_value = val.to_string();
+                    val == wanted
+                }
+                _ => false,
+            }
+        });
+    }
+
+    pub fn refresh_watched(&mut self){
+        let handle = self.handle;
+        for x in self.watched_rows.iter_mut() {
+            if x.is_frozen {
+                if x.value_type == EValueType::I32 {
+                    if let Ok(val) = x.cached_value.trim().parse::<i32>() {
+                        let _ = Self::write_bytes_to_handle(handle, x.address, &val.to_le_bytes());
+                    }
+                }
+                continue;
+            }
+
+            match Self::read_bytes_from_handle(handle, x.address, 4) {
+                Ok(bytes) if bytes.len() == 4 => {
+                    let val = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    x.cached_value = val.to_string();
+                }
+                _ => continue
+            }
+        }
+    }
+
+    pub fn update_watched_value(&mut self, index: usize) -> io::Result<()> {
+        let Some(row) = self.watched_rows.get(index) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid watched row index"));
+        };
+
+        if row.value_type != EValueType::I32 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Only I32 update is implemented",
+            ));
+        }
+
+        let parsed = row
+            .cached_value
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Failed to parse i32"))?;
+
+        Self::write_bytes_to_handle(self.handle, row.address, &parsed.to_le_bytes())
     }
 
     pub fn reset_scan(&mut self) {
@@ -139,12 +199,16 @@ impl OpenedProcess {
 
 
     pub fn read_bytes(&self, address: usize, size: usize) -> io::Result<Vec<u8>> {
+        Self::read_bytes_from_handle(self.handle, address, size)
+    }
+
+    fn read_bytes_from_handle(handle: HANDLE, address: usize, size: usize) -> io::Result<Vec<u8>> {
         let mut buffer = vec![0u8; size];
         let mut bytes_read = 0usize;
 
         let ok = unsafe {
             ReadProcessMemory(
-                self.handle,
+                handle,
                 address as *const c_void,
                 buffer.as_mut_ptr() as *mut c_void,
                 size,
@@ -158,6 +222,68 @@ impl OpenedProcess {
 
         buffer.truncate(bytes_read);
         Ok(buffer)
+    }
+
+    fn write_bytes_to_handle(handle: HANDLE, address: usize, bytes: &[u8]) -> io::Result<()> {
+        let mut bytes_written = 0usize;
+        let direct_ok = unsafe {
+            WriteProcessMemory(
+                handle,
+                address as *const c_void,
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+                &mut bytes_written,
+            )
+        };
+
+        if direct_ok != 0 && bytes_written == bytes.len() {
+            return Ok(());
+        }
+
+        let direct_error = io::Error::last_os_error();
+
+        let mut old_protect = 0u32;
+        let protect_changed = unsafe {
+            VirtualProtectEx(
+                handle,
+                address as *const c_void,
+                bytes.len(),
+                PAGE_EXECUTE_READWRITE,
+                &mut old_protect,
+            )
+        };
+
+        if protect_changed == 0 {
+            return Err(direct_error);
+        }
+
+        bytes_written = 0;
+        let write_after_protect = unsafe {
+            WriteProcessMemory(
+                handle,
+                address as *const c_void,
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+                &mut bytes_written,
+            )
+        };
+
+        let mut restored_protect_out = 0u32;
+        let _ = unsafe {
+            VirtualProtectEx(
+                handle,
+                address as *const c_void,
+                bytes.len(),
+                old_protect,
+                &mut restored_protect_out,
+            )
+        };
+
+        if write_after_protect == 0 || bytes_written != bytes.len() {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
     }
 
     fn run_full_scan_worker(
@@ -243,6 +369,7 @@ impl OpenedProcess {
                                     address: address + i,
                                     value_type: EValueType::I32,
                                     cached_value: wanted.to_string(),
+                                    is_frozen: false,
                                 }));
                             }
                         }

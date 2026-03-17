@@ -474,6 +474,10 @@ impl App {
             ui.heading("Scanner");
             ui.separator();
 
+            if process.watched_rows.iter().any(|row| row.is_frozen) {
+                process.refresh_watched();
+            }
+
             ui.horizontal(|ui| {
                 ui.label("Value:");
 
@@ -509,7 +513,14 @@ impl App {
                 if ui.button("Reset").clicked() {
                     process.reset_scan();
                 }
-                
+
+                let can_refresh_watched = !process.watched_rows.is_empty();
+                if ui
+                    .add_enabled(can_refresh_watched, egui::Button::new("Refresh Watched"))
+                    .clicked()
+                {
+                    process.refresh_watched();
+                }
 
                 ui.label("Displayed rows:");
                 let max_rows_response = ui.add(
@@ -528,6 +539,16 @@ impl App {
             ui.label(format!("Scan results: {}", process.scan.results.len()));
 
             ui.separator();
+            ui.heading("Watched");
+            ui.separator();
+
+            Self::draw_watched_table(
+                ui,
+                process,
+                ("watched_rows_table", process.pid),
+            );
+
+            ui.separator();
             ui.heading("Scan Results");
             ui.separator();
 
@@ -536,52 +557,151 @@ impl App {
             if process.scan.results.is_empty() {
                 ui.label("No scan results");
             } else {
-                Self::draw_table(ui, &process.scan.results, ("scan_results_table", process.pid), process.scan.scan_results_count, false);
+                Self::draw_scan_results_table(
+                    ui,
+                    &process.scan.results,
+                    ("scan_results_table", process.pid),
+                    process.scan.scan_results_count,
+                    &mut process.watched_rows,
+                );
             }
         }
     }
 
-    fn draw_table(ui: &mut Ui, results: &[ResultRow], table_id: (&str, u32), display_count: usize, has_description: bool) {
+    fn draw_watched_table(ui: &mut Ui, process: &mut OpenedProcess, table_id: (&str, u32)) {
+        if process.watched_rows.is_empty() {
+            ui.label("No watched rows");
+            return;
+        }
+
+        let row_height = 24.0;
+        let header_height = 24.0;
+        let available_width = ui.available_width().max(420.0);
+        let max_scroll_height = 200.0;
+
+        let address_width = (available_width * 0.24).clamp(110.0, 260.0);
+        let type_width = (available_width * 0.14).clamp(76.0, 120.0);
+        let action_width = 220.0;
+
+        let mut remove_index = None;
+        let mut update_index = None;
+        let mut toggle_freeze_index = None;
+
+        {
+            let rows = &mut process.watched_rows;
+            TableBuilder::new(ui)
+                .id_salt(table_id)
+                .striped(true)
+                .resizable(false)
+                .cell_layout(egui::Layout::left_to_right(Align::Center))
+                .min_scrolled_height(84.0)
+                .max_scroll_height(max_scroll_height)
+                .column(Column::remainder().at_least(140.0).clip(true))
+                .column(Column::initial(address_width).at_least(110.0).clip(true))
+                .column(Column::initial(type_width).at_least(76.0).clip(true))
+                .column(Column::remainder().at_least(120.0).clip(true))
+                .column(Column::initial(action_width).at_least(180.0).clip(true))
+                .header(header_height, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("Description");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Address");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Type");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Value");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Action");
+                    });
+                })
+                .body(|body| {
+                    body.rows(row_height, rows.len(), |mut row| {
+                        let idx = row.index();
+                        let item = &mut rows[idx];
+
+                        row.col(|ui| {
+                            let description = item.description.get_or_insert_with(String::new);
+                            ui.add(egui::TextEdit::singleline(description).desired_width(f32::INFINITY));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(format!("0x{:X}", item.address));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{:?}", item.value_type));
+                        });
+                        row.col(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut item.cached_value)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button("Update").clicked() {
+                                    update_index = Some(idx);
+                                }
+
+                                let freeze_label = if item.is_frozen { "Unfreeze" } else { "Freeze" };
+                                if ui.button(freeze_label).clicked() {
+                                    toggle_freeze_index = Some(idx);
+                                }
+
+                                if ui.button("Remove").clicked() {
+                                    remove_index = Some(idx);
+                                }
+                            });
+                        });
+                    });
+                });
+        }
+
+        if let Some(idx) = update_index {
+            let _ = process.update_watched_value(idx);
+        }
+
+        if let Some(idx) = toggle_freeze_index {
+            if let Some(row) = process.watched_rows.get_mut(idx) {
+                row.is_frozen = !row.is_frozen;
+            }
+        }
+
+        if let Some(idx) = remove_index {
+            process.watched_rows.remove(idx);
+        }
+    }
+
+    fn draw_scan_results_table(
+        ui: &mut Ui,
+        results: &[ResultRow],
+        table_id: (&str, u32),
+        display_count: usize,
+        watched_rows: &mut Vec<ResultRow>,
+    ) {
         let row_height = 24.0;
         let header_height = 24.0;
         let available_width = ui.available_width().max(320.0);
         let max_scroll_height = 260.0;//(ui.available_height() * 0.85).max(260.0);
 
-        let address_width = (available_width * 0.25).clamp(110.0, 260.0);
         let type_width = (available_width * 0.14).clamp(76.0, 120.0);
         let value_width = (available_width * 0.24).clamp(96.0, 220.0);
         let action_width = 72.0;
 
-        let base_table = TableBuilder::new(ui)
+        TableBuilder::new(ui)
             .id_salt(table_id)
             .striped(true)
             .resizable(false)
             .cell_layout(egui::Layout::left_to_right(Align::Center))
             .min_scrolled_height(140.0)
-            .max_scroll_height(max_scroll_height);
-
-        let table = if has_description {
-            base_table
-                .column(Column::remainder().at_least(120.0).clip(true).resizable(false))
-                .column(Column::initial(address_width).at_least(110.0).at_most(available_width * 0.4).clip(true).resizable(false))
-                .column(Column::initial(type_width).at_least(76.0).at_most(120.0).clip(true).resizable(false))
-                .column(Column::initial(value_width).at_least(96.0).at_most(220.0).clip(true).resizable(false))
-                .column(Column::initial(action_width).at_least(64.0).at_most(80.0).clip(true).resizable(false))
-        } else {
-            base_table
-                .column(Column::remainder().at_least(120.0).clip(true).resizable(false))
-                .column(Column::initial(type_width).at_least(76.0).at_most(120.0).clip(true).resizable(false))
-                .column(Column::initial(value_width).at_least(96.0).at_most(220.0).clip(true).resizable(false))
-                .column(Column::initial(action_width).at_least(64.0).at_most(80.0).clip(true).resizable(false))
-        };
-
-        table
+            .max_scroll_height(max_scroll_height)
+            .column(Column::remainder().at_least(120.0).clip(true).resizable(false))
+            .column(Column::initial(type_width).at_least(76.0).at_most(120.0).clip(true).resizable(false))
+            .column(Column::initial(value_width).at_least(96.0).at_most(220.0).clip(true).resizable(false))
+            .column(Column::initial(action_width).at_least(64.0).at_most(80.0).clip(true).resizable(false))
             .header(header_height, |mut header| {
-                if has_description {
-                    header.col(|ui| {
-                        ui.strong("Description");
-                    });
-                }
                 header.col(|ui| {
                     ui.strong("Address");
                 });
@@ -599,11 +719,6 @@ impl App {
                 body.rows(row_height, results.len().min(display_count), |mut row| {
                     let item = &results[row.index()];
 
-                    if has_description {
-                        row.col(|ui| {
-                            ui.label(item.description.as_deref().unwrap_or("-"));
-                        });
-                    }
                     row.col(|ui| {
                         ui.monospace(format!("0x{:X}", item.address));
                     });
@@ -614,8 +729,21 @@ impl App {
                         ui.label(item.cached_value.as_str());
                     });
                     row.col(|ui| {
-                        if ui.button("Add").clicked() {
-                            // add
+                        let is_watched = watched_rows.iter().any(|row| row.address == item.address);
+                        let button_label = if is_watched { "Remove" } else { "Add" };
+
+                        if ui.button(button_label).clicked() {
+                            if is_watched {
+                                watched_rows.retain(|row| row.address != item.address);
+                            } else {
+                                watched_rows.push(ResultRow {
+                                    description: Some(String::new()),
+                                    address: item.address,
+                                    value_type: item.value_type,
+                                    cached_value: item.cached_value.clone(),
+                                    is_frozen: false,
+                                });
+                            }
                         }
                     });
                 });
