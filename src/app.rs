@@ -23,6 +23,7 @@ pub struct App{
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let _ = cc;
         Self::default()
     }
 }
@@ -47,7 +48,20 @@ impl Default for App{
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        
+        let _ = frame;
+
+        if let Some(process) = &self.opened_process {
+            let has_frozen = process.watched_rows.iter().any(|row| row.is_frozen);
+            let has_pending_verify = process
+                .watched_rows
+                .iter()
+                .any(|row| row.verify_after_at.is_some());
+
+            if has_frozen || has_pending_verify {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.app_state {
                 AppState::ProcessSelection => {

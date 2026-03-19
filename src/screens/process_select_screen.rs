@@ -470,6 +470,8 @@ impl App {
 
     fn draw_registers_table(&mut self, _ctx: &Context, ui: &mut Ui) {
         if let Some(process) = &mut self.opened_process {
+            process.poll_write_verifications();
+
             ui.separator();
             ui.heading("Scanner");
             ui.separator();
@@ -545,6 +547,7 @@ impl App {
             Self::draw_watched_table(
                 ui,
                 process,
+                &mut self.console,
                 ("watched_rows_table", process.pid),
             );
 
@@ -568,7 +571,12 @@ impl App {
         }
     }
 
-    fn draw_watched_table(ui: &mut Ui, process: &mut OpenedProcess, table_id: (&str, u32)) {
+    fn draw_watched_table(
+        ui: &mut Ui,
+        process: &mut OpenedProcess,
+        console: &mut crate::classes::c_console::Console,
+        table_id: (&str, u32),
+    ) {
         if process.watched_rows.is_empty() {
             ui.label("No watched rows");
             return;
@@ -576,12 +584,13 @@ impl App {
 
         let row_height = 24.0;
         let header_height = 24.0;
-        let available_width = ui.available_width().max(420.0);
+        let available_width = ui.available_width().max(760.0);
         let max_scroll_height = 200.0;
 
-        let address_width = (available_width * 0.24).clamp(110.0, 260.0);
-        let type_width = (available_width * 0.14).clamp(76.0, 120.0);
+        let address_width = (available_width * 0.16).clamp(110.0, 220.0);
+        let type_width = (available_width * 0.08).clamp(76.0, 100.0);
         let action_width = 220.0;
+        let verify_width = (available_width * 0.16).clamp(140.0, 220.0);
 
         let mut remove_index = None;
         let mut update_index = None;
@@ -600,6 +609,7 @@ impl App {
                 .column(Column::initial(address_width).at_least(110.0).clip(true))
                 .column(Column::initial(type_width).at_least(76.0).clip(true))
                 .column(Column::remainder().at_least(120.0).clip(true))
+                .column(Column::initial(verify_width).at_least(140.0).clip(true))
                 .column(Column::initial(action_width).at_least(180.0).clip(true))
                 .header(header_height, |mut header| {
                     header.col(|ui| {
@@ -613,6 +623,9 @@ impl App {
                     });
                     header.col(|ui| {
                         ui.strong("Value");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Verify");
                     });
                     header.col(|ui| {
                         ui.strong("Action");
@@ -640,6 +653,34 @@ impl App {
                             );
                         });
                         row.col(|ui| {
+                            let write_status = match item.write_ok {
+                                Some(true) => "OK",
+                                Some(false) => "FAIL",
+                                None => "-",
+                            };
+
+                            let after_write_status = match item.value_after_write.as_deref() {
+                                Some(v) if v.starts_with("ERR:") => "FAIL",
+                                Some(_) => "OK",
+                                None => "-",
+                            };
+
+                            let after_100ms_status = match item.value_after_100ms.as_deref() {
+                                Some(v) if v.starts_with("ERR:") => "FAIL",
+                                Some(v) => match item.value_after_write.as_deref() {
+                                    Some(expected) if expected == v => "OK",
+                                    Some(_) => "FAIL",
+                                    None => "OK",
+                                },
+                                None => "-",
+                            };
+
+                            ui.monospace(format!(
+                                "{} | {} | {}",
+                                write_status, after_write_status, after_100ms_status
+                            ));
+                        });
+                        row.col(|ui| {
                             ui.horizontal(|ui| {
                                 if ui.button("Update").clicked() {
                                     update_index = Some(idx);
@@ -660,12 +701,55 @@ impl App {
         }
 
         if let Some(idx) = update_index {
-            let _ = process.update_watched_value(idx);
+            let addr = process.watched_rows.get(idx).map(|r| r.address).unwrap_or(0);
+            match process.update_watched_value(idx) {
+                Ok(_) => {
+                    console.add_message(ConsoleRow::new(
+                        format!("Updated watched value at 0x{addr:X}"),
+                        EMessageType::Success,
+                    ));
+                }
+                Err(e) => {
+                    console.add_message(ConsoleRow::new(
+                        format!("Update failed at 0x{addr:X}: {e}"),
+                        EMessageType::Error,
+                    ));
+                }
+            }
         }
 
         if let Some(idx) = toggle_freeze_index {
-            if let Some(row) = process.watched_rows.get_mut(idx) {
-                row.is_frozen = !row.is_frozen;
+            let make_frozen = process
+                .watched_rows
+                .get(idx)
+                .map(|row| !row.is_frozen)
+                .unwrap_or(false);
+
+            if make_frozen {
+                let addr = process.watched_rows.get(idx).map(|r| r.address).unwrap_or(0);
+                match process.update_watched_value(idx) {
+                    Ok(_) => {
+                        if let Some(row) = process.watched_rows.get_mut(idx) {
+                            row.is_frozen = true;
+                        }
+                        console.add_message(ConsoleRow::new(
+                            format!("Freeze enabled at 0x{addr:X}"),
+                            EMessageType::Success,
+                        ));
+                    }
+                    Err(e) => {
+                        console.add_message(ConsoleRow::new(
+                            format!("Freeze failed at 0x{addr:X}: {e}"),
+                            EMessageType::Error,
+                        ));
+                    }
+                }
+            } else if let Some(row) = process.watched_rows.get_mut(idx) {
+                row.is_frozen = false;
+                console.add_message(ConsoleRow::new(
+                    format!("Freeze disabled at 0x{:X}", row.address),
+                    EMessageType::Log,
+                ));
             }
         }
 
@@ -742,6 +826,10 @@ impl App {
                                     value_type: item.value_type,
                                     cached_value: item.cached_value.clone(),
                                     is_frozen: false,
+                                    write_ok: None,
+                                    value_after_write: None,
+                                    value_after_100ms: None,
+                                    verify_after_at: None,
                                 });
                             }
                         }

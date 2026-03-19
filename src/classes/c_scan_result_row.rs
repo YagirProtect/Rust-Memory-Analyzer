@@ -1,5 +1,6 @@
-﻿use crate::classes::e_value_type::EValueType;
+use crate::classes::e_value_type::EValueType;
 use std::sync::mpsc::Receiver;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct ResultRow {
@@ -8,6 +9,10 @@ pub struct ResultRow {
     pub value_type: EValueType,
     pub cached_value: String,
     pub is_frozen: bool,
+    pub write_ok: Option<bool>,
+    pub value_after_write: Option<String>,
+    pub value_after_100ms: Option<String>,
+    pub verify_after_at: Option<Instant>,
 }
 
 pub struct ScanState {
@@ -21,7 +26,7 @@ pub struct ScanState {
 
 impl Default for ScanState {
     fn default() -> Self {
-        Self{
+        Self {
             input_value: "".to_string(),
             results: vec![],
             has_scan_session: false,

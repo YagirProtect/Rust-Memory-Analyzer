@@ -6,7 +6,13 @@ use crate::classes::e_message_type::EMessageType;
 use crate::classes::e_value_type::EValueType;
 use eframe::egui;
 use std::sync::mpsc;
-use std::{ffi::c_void, io, mem::{size_of, zeroed}, thread};
+use std::{
+    ffi::c_void,
+    io,
+    mem::{size_of, zeroed},
+    thread,
+    time::{Duration, Instant},
+};
 use windows_sys::Win32::{
     Foundation::HANDLE,
     System::{
@@ -130,18 +136,26 @@ impl OpenedProcess {
             return;
         }
 
-        let wanted = match self.scan.input_value.trim().parse::<i32>() {
-            Ok(v) => v,
+        let value_type = self
+            .scan
+            .results
+            .first()
+            .map(|row| row.value_type)
+            .unwrap_or(self.scan.selected_value_type);
+        let wanted_bytes = match Self::typed_value_to_bytes(value_type, self.scan.input_value.trim()) {
+            Ok(bytes) => bytes,
             Err(_) => return,
         };
+        let value_size = wanted_bytes.len();
 
         let handle = self.handle;
         self.scan.results.retain_mut(|row| {
-            match Self::read_bytes_from_handle(handle, row.address, 4) {
-                Ok(bytes) if bytes.len() == 4 => {
-                    let val = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                    row.cached_value = val.to_string();
-                    val == wanted
+            match Self::read_bytes_from_handle(handle, row.address, value_size) {
+                Ok(bytes) if bytes.len() == value_size => {
+                    if let Ok(current_value) = Self::typed_bytes_to_string(value_type, bytes.as_slice()) {
+                        row.cached_value = current_value;
+                    }
+                    bytes == wanted_bytes
                 }
                 _ => false,
             }
@@ -152,21 +166,39 @@ impl OpenedProcess {
         let handle = self.handle;
         for x in self.watched_rows.iter_mut() {
             if x.is_frozen {
-                if x.value_type == EValueType::I32 {
-                    if let Ok(val) = x.cached_value.trim().parse::<i32>() {
-                        let _ = Self::write_bytes_to_handle(handle, x.address, &val.to_le_bytes());
-                    }
+                if let Ok(bytes_to_write) =
+                    Self::typed_value_to_bytes(x.value_type, x.cached_value.as_str())
+                {
+                    let _ = Self::write_bytes_to_handle(handle, x.address, bytes_to_write.as_slice());
                 }
                 continue;
             }
 
-            match Self::read_bytes_from_handle(handle, x.address, 4) {
-                Ok(bytes) if bytes.len() == 4 => {
-                    let val = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                    x.cached_value = val.to_string();
-                }
+            match Self::read_typed_value_as_string(handle, x.address, x.value_type) {
+                Ok(val) => x.cached_value = val,
                 _ => continue
             }
+        }
+    }
+
+    pub fn poll_write_verifications(&mut self) {
+        let now = Instant::now();
+        let handle = self.handle;
+
+        for row in self.watched_rows.iter_mut() {
+            let Some(deadline) = row.verify_after_at else {
+                continue;
+            };
+
+            if now < deadline {
+                continue;
+            }
+
+            row.value_after_100ms = match Self::read_typed_value_as_string(handle, row.address, row.value_type) {
+                Ok(v) => Some(v),
+                Err(e) => Some(format!("ERR: {e}")),
+            };
+            row.verify_after_at = None;
         }
     }
 
@@ -175,20 +207,33 @@ impl OpenedProcess {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid watched row index"));
         };
 
-        if row.value_type != EValueType::I32 {
+        let address = row.address;
+        let value_type = row.value_type;
+        let input_value = row.cached_value.clone();
+
+        let bytes_to_write = Self::typed_value_to_bytes(value_type, input_value.as_str())?;
+        Self::write_bytes_to_handle(self.handle, address, bytes_to_write.as_slice())?;
+
+        let read_back_raw = Self::read_bytes_from_handle(self.handle, address, bytes_to_write.len())?;
+        let read_back = Self::read_typed_value_as_string(self.handle, address, value_type)?;
+        let write_ok = read_back_raw == bytes_to_write;
+
+        if let Some(row_mut) = self.watched_rows.get_mut(index) {
+            row_mut.cached_value = read_back;
+            row_mut.write_ok = Some(write_ok);
+            row_mut.value_after_write = Some(row_mut.cached_value.clone());
+            row_mut.value_after_100ms = None;
+            row_mut.verify_after_at = Some(Instant::now() + Duration::from_millis(100));
+        }
+
+        if !write_ok {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Only I32 update is implemented",
+                io::ErrorKind::Other,
+                "Write verification failed: value changed immediately",
             ));
         }
 
-        let parsed = row
-            .cached_value
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Failed to parse i32"))?;
-
-        Self::write_bytes_to_handle(self.handle, row.address, &parsed.to_le_bytes())
+        Ok(())
     }
 
     pub fn reset_scan(&mut self) {
@@ -222,6 +267,125 @@ impl OpenedProcess {
 
         buffer.truncate(bytes_read);
         Ok(buffer)
+    }
+
+    fn read_typed_value_as_string(
+        handle: HANDLE,
+        address: usize,
+        value_type: EValueType,
+    ) -> io::Result<String> {
+        match value_type {
+            EValueType::I32 => {
+                let bytes = Self::read_bytes_from_handle(handle, address, 4)?;
+                if bytes.len() != 4 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Expected 4 bytes"));
+                }
+                Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string())
+            }
+            EValueType::I64 => {
+                let bytes = Self::read_bytes_from_handle(handle, address, 8)?;
+                if bytes.len() != 8 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Expected 8 bytes"));
+                }
+                Ok(i64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]).to_string())
+            }
+            EValueType::F32 => {
+                let bytes = Self::read_bytes_from_handle(handle, address, 4)?;
+                if bytes.len() != 4 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Expected 4 bytes"));
+                }
+                Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string())
+            }
+            EValueType::F64 => {
+                let bytes = Self::read_bytes_from_handle(handle, address, 8)?;
+                if bytes.len() != 8 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Expected 8 bytes"));
+                }
+                Ok(f64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]).to_string())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported watched value type",
+            )),
+        }
+    }
+
+    fn typed_value_to_bytes(value_type: EValueType, value: &str) -> io::Result<Vec<u8>> {
+        match value_type {
+            EValueType::I32 => {
+                let parsed = value
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Failed to parse i32"))?;
+                Ok(parsed.to_le_bytes().to_vec())
+            }
+            EValueType::I64 => {
+                let parsed = value
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Failed to parse i64"))?;
+                Ok(parsed.to_le_bytes().to_vec())
+            }
+            EValueType::F32 => {
+                let parsed = value
+                    .trim()
+                    .parse::<f32>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Failed to parse f32"))?;
+                Ok(parsed.to_le_bytes().to_vec())
+            }
+            EValueType::F64 => {
+                let parsed = value
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Failed to parse f64"))?;
+                Ok(parsed.to_le_bytes().to_vec())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported watched value type",
+            )),
+        }
+    }
+
+    fn typed_bytes_to_string(value_type: EValueType, bytes: &[u8]) -> io::Result<String> {
+        match value_type {
+            EValueType::I32 => {
+                if bytes.len() != 4 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Expected 4 bytes"));
+                }
+                Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string())
+            }
+            EValueType::I64 => {
+                if bytes.len() != 8 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Expected 8 bytes"));
+                }
+                Ok(i64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]).to_string())
+            }
+            EValueType::F32 => {
+                if bytes.len() != 4 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Expected 4 bytes"));
+                }
+                Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string())
+            }
+            EValueType::F64 => {
+                if bytes.len() != 8 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Expected 8 bytes"));
+                }
+                Ok(f64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]).to_string())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported scan value type",
+            )),
+        }
     }
 
     fn write_bytes_to_handle(handle: HANDLE, address: usize, bytes: &[u8]) -> io::Result<()> {
@@ -293,23 +457,23 @@ impl OpenedProcess {
         tx: std::sync::mpsc::Sender<ScanMessage>,
         ctx: egui::Context,
     ) {
-        let wanted = match value_type {
-            EValueType::I32 => match input.parse::<i32>() {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.send(ScanMessage::Error(format!("Failed to parse i32: {e}")));
-                    ctx.request_repaint();
-                    return;
-                }
-            },
-            _ => {
-                let _ = tx.send(ScanMessage::Error("Only I32 scan is implemented yet".to_string()));
+        let wanted_bytes = match Self::typed_value_to_bytes(value_type, input.as_str()) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = tx.send(ScanMessage::Error(format!("Failed to parse input value: {e}")));
                 ctx.request_repaint();
                 return;
             }
         };
-
-        let wanted_bytes = wanted.to_le_bytes();
+        let value_size = wanted_bytes.len();
+        let wanted_display_normalized = match Self::typed_bytes_to_string(value_type, wanted_bytes.as_slice()) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(ScanMessage::Error(format!("Failed to prepare scan value: {e}")));
+                ctx.request_repaint();
+                return;
+            }
+        };
 
         let process = match OpenedProcess::new(pid) {
             Ok(p) => p,
@@ -358,18 +522,22 @@ impl OpenedProcess {
                 let address = region.base_address + offset;
 
                 if let Ok(bytes) = process.read_bytes(address, to_read) {
-                    if bytes.len() >= 4 {
-                        for i in (0..=bytes.len() - 4).step_by(4) {
+                    if bytes.len() >= value_size {
+                        for i in (0..=bytes.len() - value_size).step_by(value_size) {
 
-                            if bytes[i..i + 4] == wanted_bytes {
+                            if bytes[i..i + value_size] == wanted_bytes {
                                 found += 1;
 
                                 let _ = tx.send(ScanMessage::Found(ResultRow {
                                     description: None,
                                     address: address + i,
-                                    value_type: EValueType::I32,
-                                    cached_value: wanted.to_string(),
+                                    value_type,
+                                    cached_value: wanted_display_normalized.clone(),
                                     is_frozen: false,
+                                    write_ok: None,
+                                    value_after_write: None,
+                                    value_after_100ms: None,
+                                    verify_after_at: None,
                                 }));
                             }
                         }
