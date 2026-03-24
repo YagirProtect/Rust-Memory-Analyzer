@@ -107,8 +107,8 @@ impl OpenedProcess {
         }
 
         let pid = self.pid;
-        let input = self.scan.input_value.trim().to_string();
         let value_type = self.scan.selected_value_type;
+        let input = Self::normalize_scan_input(value_type, self.scan.input_value.as_str());
 
         let (tx, rx) = mpsc::channel::<ScanMessage>();
         self.scan.results.clear();
@@ -142,11 +142,15 @@ impl OpenedProcess {
             .first()
             .map(|row| row.value_type)
             .unwrap_or(self.scan.selected_value_type);
-        let wanted_bytes = match Self::typed_value_to_bytes(value_type, self.scan.input_value.trim()) {
+        let input = Self::normalize_scan_input(value_type, self.scan.input_value.as_str());
+        let wanted_bytes = match Self::typed_value_to_bytes(value_type, input.as_str()) {
             Ok(bytes) => bytes,
             Err(_) => return,
         };
         let value_size = wanted_bytes.len();
+        if value_size == 0 {
+            return;
+        }
 
         let handle = self.handle;
         self.scan.results.retain_mut(|row| {
@@ -344,10 +348,27 @@ impl OpenedProcess {
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Failed to parse f64"))?;
                 Ok(parsed.to_le_bytes().to_vec())
             }
+            EValueType::Utf8String => {
+                Ok(value.as_bytes().to_vec())
+            }
+            EValueType::Utf16String => {
+                let mut out = Vec::with_capacity(value.len() * 2);
+                for unit in value.encode_utf16() {
+                    out.extend_from_slice(&unit.to_le_bytes());
+                }
+                Ok(out)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Unsupported watched value type",
             )),
+        }
+    }
+
+    fn normalize_scan_input(value_type: EValueType, input: &str) -> String {
+        match value_type {
+            EValueType::Utf8String | EValueType::Utf16String => input.to_string(),
+            _ => input.trim().to_string(),
         }
     }
 
@@ -380,6 +401,31 @@ impl OpenedProcess {
                 Ok(f64::from_le_bytes([
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]).to_string())
+            }
+            EValueType::Utf8String => {
+                match std::str::from_utf8(&bytes) {
+                    Ok(str) => {
+                        Ok(str.to_string())
+                    }
+                    Err(_) => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "Cant convert bytes to string UTF8"));
+                    }
+                }
+            }
+            EValueType::Utf16String => {
+                let units: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+
+                match String::from_utf16(&units) {
+                    Ok(str) => {
+                        Ok(str)
+                    }
+                    Err(_) => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "Cant convert bytes to string UTF16"));
+                    }
+                }
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -466,6 +512,11 @@ impl OpenedProcess {
             }
         };
         let value_size = wanted_bytes.len();
+        if value_size == 0 {
+            let _ = tx.send(ScanMessage::Error("Input value cannot be empty".to_string()));
+            ctx.request_repaint();
+            return;
+        }
         let wanted_display_normalized = match Self::typed_bytes_to_string(value_type, wanted_bytes.as_slice()) {
             Ok(v) => v,
             Err(e) => {
@@ -517,20 +568,36 @@ impl OpenedProcess {
             scanned_regions += 1;
 
             let mut offset = 0usize;
+            let mut carry_tail: Vec<u8> = Vec::new();
             while offset < region.region_size {
                 let to_read = CHUNK_SIZE.min(region.region_size - offset);
                 let address = region.base_address + offset;
 
                 if let Ok(bytes) = process.read_bytes(address, to_read) {
-                    if bytes.len() >= value_size {
-                        for i in (0..=bytes.len() - value_size).step_by(value_size) {
+                    let step = match value_type {
+                        EValueType::Utf8String | EValueType::Utf16String => 1,
+                        _ => value_size,
+                    };
+                    let use_overlap = matches!(value_type, EValueType::Utf8String | EValueType::Utf16String);
 
-                            if bytes[i..i + value_size] == wanted_bytes {
+                    let (scan_base, scan_bytes) = if use_overlap && !carry_tail.is_empty() {
+                        let mut merged = Vec::with_capacity(carry_tail.len() + bytes.len());
+                        merged.extend_from_slice(carry_tail.as_slice());
+                        merged.extend_from_slice(bytes.as_slice());
+                        (address.saturating_sub(carry_tail.len()), merged)
+                    } else {
+                        (address, bytes)
+                    };
+
+                    if scan_bytes.len() >= value_size {
+                        for i in (0..=scan_bytes.len() - value_size).step_by(step) {
+
+                            if scan_bytes[i..i + value_size] == wanted_bytes {
                                 found += 1;
 
                                 let _ = tx.send(ScanMessage::Found(ResultRow {
                                     description: None,
-                                    address: address + i,
+                                    address: scan_base + i,
                                     value_type,
                                     cached_value: wanted_display_normalized.clone(),
                                     is_frozen: false,
@@ -542,6 +609,15 @@ impl OpenedProcess {
                             }
                         }
                     }
+
+                    if use_overlap && value_size > 1 {
+                        let tail_len = (value_size - 1).min(scan_bytes.len());
+                        carry_tail = scan_bytes[scan_bytes.len() - tail_len..].to_vec();
+                    } else {
+                        carry_tail.clear();
+                    }
+                } else {
+                    carry_tail.clear();
                 }
 
                 offset += to_read;

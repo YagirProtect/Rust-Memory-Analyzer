@@ -498,6 +498,8 @@ impl App {
                         ui.selectable_value(&mut process.scan.selected_value_type, EValueType::I64, "I64");
                         ui.selectable_value(&mut process.scan.selected_value_type, EValueType::F32, "F32");
                         ui.selectable_value(&mut process.scan.selected_value_type, EValueType::F64, "F64");
+                        ui.selectable_value(&mut process.scan.selected_value_type, EValueType::Utf8String, "UTF8String");
+                        ui.selectable_value(&mut process.scan.selected_value_type, EValueType::Utf16String, "UTF16String");
                     });
 
                 if ui.button("Full Scan").clicked() {

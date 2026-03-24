@@ -6,5 +6,6 @@ pub enum EValueType {
     F32,
     F64,
     Utf8String,
+    Utf16String,
     Bytes,
 }
